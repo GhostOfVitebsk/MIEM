@@ -1,10 +1,9 @@
 #include "Socket.h"
 #include <arpa/inet.h>
 #include <condition_variable>
-#include <cstring>
 #include <iostream>
 #include <mutex>
-#include <netinet/in.h>
+#include <queue>
 #include <string>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -18,103 +17,168 @@ Socket::Socket(int type, const std::string &address, int port)
     socketDescriptor = socket(AF_UNIX, SOCK_STREAM, 0);
   } else if (socketType == 2) {
     socketDescriptor = socket(AF_INET, SOCK_STREAM, 0);
+    serverAddressInfo.sin_family = AF_INET;
+    serverAddressInfo.sin_addr.s_addr = inet_addr(serverAddress.c_str());
+    serverAddressInfo.sin_port = htons(serverPort);
+  } else if (socketType == 3) {
+    socketDescriptor = socket(AF_INET, SOCK_DGRAM, 0);
+    serverAddressInfo.sin_family = AF_INET;
+    serverAddressInfo.sin_addr.s_addr = inet_addr(serverAddress.c_str());
+    serverAddressInfo.sin_port = htons(serverPort);
   } else {
     std::cerr << "Invalid socket type!" << std::endl;
     socketDescriptor = -1;
   }
 }
-bool Socket::connect() {
-  if (socketDescriptor == -1) {
-    std::cerr << "Socket is not initialized!" << std::endl;
-    return false;
-  }
 
-  if (socketType == 1) {
-    struct sockaddr_un serverAddress {};
-    serverAddress.sun_family = AF_UNIX;
-    strncpy(serverAddress.sun_path, serverAddress.sun_path,
-            sizeof(serverAddress.sun_path) - 1);
+Socket::Socket(int data) { socketDescriptor = data; }
 
-    if (::connect(socketDescriptor, (struct sockaddr *)&serverAddress,
-                  sizeof(serverAddress)) == -1) {
-      std::cerr << "Failed to connect to Unix socket!" << std::endl;
-      return false;
-    }
-  } else if (socketType == 2) {
-    struct sockaddr_in ServerAddress {};
-    ServerAddress.sin_family = AF_INET;
-    ServerAddress.sin_port = htons(serverPort);
-    inet_pton(AF_INET, serverAddress.c_str(), &(ServerAddress.sin_addr));
-
-    if (::connect(socketDescriptor, (struct sockaddr *)&ServerAddress,
-                  sizeof(ServerAddress)) == -1) {
-      std::cerr << "Failed to connect to TCP socket!" << std::endl;
-      return false;
-    }
-  } else {
-    std::cerr << "Invalid socket type!" << std::endl;
-    return false;
-  }
-  return true;
-}
-
-void Socket::sendPair(const std::pair<int, std::string> &data) {
-  // std::unique_lock<std::mutex> lock(mutex);
-
-  if (socketDescriptor == -1) {
-    std::cerr << "Socket is not initialized!" << std::endl;
-    return;
-  }
-
-  std::string pairString = std::to_string(data.first) + ":" + data.second;
-
-  if (::send(socketDescriptor, pairString.c_str(), pairString.length(), 0) ==
-      -1) {
-    std::cerr << "Failed to send data over the socket!" << std::endl;
-    return;
-  }
-  // dataSent = true;
-  // cv.notify_all();
-}
-
-std::pair<int, std::string> Socket::receivePair() {
-  // std::unique_lock<std::mutex> lock(mutex);
-
-  if (socketDescriptor == -1) {
-    std::cerr << "Socket is not initialized!" << std::endl;
-    return std::make_pair(-1, "");
-  }
-
-  // cv.wait(lock, [this] { return dataSent; });
-
-  char buffer[1024];
-  memset(buffer, 0, sizeof(buffer));
-
-  ssize_t bytesRead = ::recv(socketDescriptor, buffer, sizeof(buffer) - 1, 0);
-  if (bytesRead == -1) {
-    std::cerr << "Failed to receive data from the socket!" << std::endl;
-    return std::make_pair(-1, "");
-  }
-
-  std::string receivedData(buffer, bytesRead);
-  size_t delimiterPos = receivedData.find(':');
-  if (delimiterPos == std::string::npos) {
-    std::cerr << "Received data is not in the expected format!" << std::endl;
-    return std::make_pair(-1, "");
-  }
-
-  int intValue = std::stoi(receivedData.substr(0, delimiterPos));
-  std::string stringValue = receivedData.substr(delimiterPos + 1);
-
-  // dataSent = false;
-  // cv.notify_all();
-
-  return std::make_pair(intValue, stringValue);
-}
-
+int Socket::getSocketDescriptor() { return socketDescriptor; }
 void Socket::close() {
   if (socketDescriptor != -1) {
     ::close(socketDescriptor);
     socketDescriptor = -1;
   }
+}
+std::pair<std::string, std::string> Socket::Deserialize(const char *input) {
+  std::string str(input);
+  size_t delimiterPos = str.find(':');
+  if (delimiterPos == std::string::npos) {
+    return std::make_pair("", "");
+  }
+
+  std::string first = str.substr(0, delimiterPos);
+  std::string second = str.substr(delimiterPos + 1);
+
+  return std::make_pair(first, second);
+}
+char *Socket::Serialize(const std::pair<std::string, std::string> &input) {
+  std::string result = input.first + ":" + input.second;
+
+  char *output = new char[result.length() + 1];
+  strcpy(output, result.c_str());
+
+  return output;
+}
+void Socket::Serve(std::queue<std::pair<std::string, std::string>> &dataQueue) {
+  std::mutex mutex;
+  std::condition_variable cv;
+
+  std::thread receiverThread([&]() {
+    char buffer[1024];
+
+    while (true) {
+
+      ssize_t bytesRead = recv(socketDescriptor, buffer, sizeof(buffer), 0);
+
+      if (bytesRead <= 0) {
+
+        break;
+      }
+
+      std::pair<std::string, std::string> deserializedData =
+          Deserialize(buffer);
+      std::cout << "Received: " << deserializedData.first << " "
+                << deserializedData.second << std::endl;
+
+      std::unique_lock<std::mutex> lock(mutex);
+      dataQueue.push(deserializedData);
+      lock.unlock();
+
+      cv.notify_one();
+    }
+  });
+
+  std::thread senderThread([&]() {
+    while (true) {
+
+      std::unique_lock<std::mutex> lock(mutex);
+
+      cv.wait(lock, [&]() { return !dataQueue.empty(); });
+
+      std::pair<std::string, std::string> data = dataQueue.front();
+      dataQueue.pop();
+      // Здесь будет полезная работа пока что заглушка
+      std::cout << "Doing job " << data.first << " with data " << data.second << std::endl;
+      lock.unlock();
+
+      char *serializedData = Serialize(data);
+
+      ssize_t bytesSent =
+          send(socketDescriptor, serializedData, strlen(serializedData), 0);
+
+      delete[] serializedData;
+
+      if (bytesSent <= 0) {
+        break;
+      }
+    }
+  });
+  receiverThread.join();
+  senderThread.join();
+}
+
+void Socket::Connect() {
+  if (connect(socketDescriptor, (struct sockaddr *)&serverAddressInfo,
+              sizeof(serverAddressInfo)) < 0) {
+    std::cout << "Failed to connect to the server" << std::endl;
+    return;
+  }
+  std::cout << "Connected to the server" << std::endl;
+}
+
+void Socket::beClient() {
+
+  std::mutex mutex;
+  std::condition_variable cv;
+
+  std::thread senderThread([&]() {
+    while (true) {
+
+      std::unique_lock<std::mutex> lock(mutex);
+
+      std::string instruction, payload;
+      std::cin >> instruction >> payload;
+      std::pair<std::string, std::string> data =
+          std::make_pair(instruction, payload);
+
+      lock.unlock();
+
+      char *serializedData = Serialize(data);
+      printf("Sending: %s\n", serializedData);
+
+      ssize_t bytesSent =
+          send(socketDescriptor, serializedData, strlen(serializedData), 0);
+
+      delete[] serializedData;
+
+      if (bytesSent <= 0) {
+        break;
+      }
+    }
+  });
+  std::thread receiverThread([&]() {
+    char buffer[1024];
+
+    while (true) {
+
+      ssize_t bytesRead = recv(socketDescriptor, buffer, sizeof(buffer), 0);
+
+      if (bytesRead <= 0) {
+
+        break;
+      }
+
+      std::pair<std::string, std::string> deserializedData =
+          Deserialize(buffer);
+      std::cout << "Received: " << deserializedData.first << " "
+                << deserializedData.second << std::endl;
+
+      std::unique_lock<std::mutex> lock(mutex);
+
+      cv.notify_one();
+    }
+  });
+  receiverThread.join();
+  senderThread.join();
 }
