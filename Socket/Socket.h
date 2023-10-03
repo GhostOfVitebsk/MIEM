@@ -2,23 +2,26 @@
 #define SOCKET_H
 
 #include <string>
-
+#include <arpa/inet.h>
+#include <queue>
+#include <utility>
 class Socket {
 public:
-  Socket(int type, const std::string &address, int port);
-  bool connect();
-  void sendPair(const std::pair<int, std::string> &data);
-  std::pair<int, std::string> receivePair();
-  void close();
-
-private:
+  int socketDescriptor;
   int socketType;
   std::string serverAddress;
+  struct sockaddr_in serverAddressInfo;
   int serverPort;
-  int socketDescriptor;
-  // std::mutex mutex;
-  // std::condition_variable cv;
-  // bool dataSent;
+
+  Socket(int type, const std::string &address, int port);
+  Socket(int data);
+  int getSocketDescriptor();
+  void close();
+  void Connect();
+  void beClient();
+  std::pair<std::string, std::string> Deserialize(const char *input);
+  char *Serialize(const std::pair<std::string, std::string> &input);
+  void Serve(std::queue<std::pair<std::string, std::string>> &dataQueue);
 };
 
 #endif
